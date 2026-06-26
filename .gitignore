@@ -225,3 +225,4 @@ models/*.pt
 models/*.onnx
 .env
 .env.local
+*.mp4
