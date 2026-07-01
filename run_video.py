@@ -73,7 +73,7 @@ WEBHOOK_SECRET = os.getenv("PETPULSE_WEBHOOK_SECRET", "change-me-in-env")
 # runner scales it to the actual frame size at load time so it lands in a
 # sensible place regardless of the source video's resolution.
 DOOR_ZONE_NORMALISED = np.array(
-    [[0.66, 0.15], [0.97, 0.15], [0.97, 0.95], [0.66, 0.95]], dtype=np.float32
+    [[0.10, 0.25], [0.23, 0.25], [0.23, 0.80], [0.10, 0.77]], dtype=np.float32
 )
 
 PACING_CROSSINGS = 3
