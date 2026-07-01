@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import uuid
+import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -16,79 +17,96 @@ from ultralytics import YOLO
 
 # ─── Configuration ───────────────────────────────────────────────
 
-MODEL_PATH = os.getenv("YOLO_MODEL_PATH", "models/yolo26n.pt")
+# AT2 Compliance: Target the exported ONNX model for CPU optimization
+MODEL_PATH = os.getenv("YOLO_MODEL_PATH", "models/yolo26n.onnx")
 CONFIDENCE_THRESHOLD = 0.25
 TARGET_CLASSES = {"dog", "cat"}
 
 LARAVEL_WEBHOOK_URL = os.getenv(
     "LARAVEL_WEBHOOK_URL", "http://127.0.0.1:8000/api/v1/behavioral-events"
 )
-WEBHOOK_SECRET = os.getenv("PETPULSE_WEBHOOK_SECRET", "change-me-in-env")
+WEBHOOK_SECRET = os.getenv("PETPULSE_WEBHOOK_SECRET", "AR9q6eCSYbPjhdfyjadgtfe")
 
 # Door Zone polygon (normalised pixel coords for a 640x480 frame).
-# Replaced with per-camera calibration in production.
 DOOR_ZONE_POLYGON = np.array(
     [[420, 80], [620, 80], [620, 460], [420, 460]], dtype=np.int32
 )
 
-# Pacing heuristic: N zone crossings within the rolling window (seconds).
 PACING_CROSSINGS = 3
 PACING_WINDOW_SECONDS = 60.0
-
-# Prolonged-waiting heuristic: continuous time-in-zone threshold (seconds).
 PROLONGED_WAIT_SECONDS = 300.0  # 5 minutes
 
 model: YOLO | None = None
 
+# ─── R-01 Thermal Mitigation Watchdog ────────────────────────────
+
+class AdaptiveThermalWatchdog:
+    """Monitors inference latency as a proxy for CPU thermal throttling."""
+    def __init__(self, target_ms: float = 66.0):
+        self.latency_history = deque(maxlen=30)
+        self.target_ms = target_ms
+        self.current_scale = 1.0
+        self.cooldown_frames = 0
+        
+    def update_and_get_scale(self, inference_time_ms: float) -> float:
+        self.latency_history.append(inference_time_ms)
+        
+        if self.cooldown_frames > 0:
+            self.cooldown_frames -= 1
+            return self.current_scale
+            
+        if len(self.latency_history) == 30:
+            avg_latency = sum(self.latency_history) / 30.0
+            
+            if avg_latency > self.target_ms and self.current_scale > 0.5:
+                print(f"[WATCHDOG] Thermal spike ({avg_latency:.1f}ms). Downscaling res.")
+                self.current_scale -= 0.25
+                self.latency_history.clear()
+                self.cooldown_frames = 150
+                
+            elif avg_latency < (self.target_ms * 0.7) and self.current_scale < 1.0:
+                print(f"[WATCHDOG] CPU recovered ({avg_latency:.1f}ms). Restoring res.")
+                self.current_scale += 0.25
+                self.latency_history.clear()
+                self.cooldown_frames = 150
+                
+        return self.current_scale
+
+watchdog = AdaptiveThermalWatchdog()
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global model
     try:
-        model = YOLO(MODEL_PATH)
+        model = YOLO(MODEL_PATH, task="detect")
     except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(f"Failed to load YOLO26n model: {exc}") from exc
+        raise RuntimeError(f"Failed to load ONNX model: {exc}") from exc
     yield
     model = None
 
-
 app = FastAPI(
     title="PetPulse Edge AI",
-    description="YOLO26n perception + Zone-Based Logic",
+    description="YOLO26n ONNX perception + Zone-Based Logic",
     version="0.2.0",
     lifespan=lifespan,
 )
 
-
 # ─── In-memory state tracker ─────────────────────────────────────
 
 class ZoneStateTracker:
-    """Lightweight per-pet state for pacing and prolonged-waiting heuristics.
-
-    All state is in-memory and ephemeral — acceptable for a single-camera
-    prototype. A production multi-camera deployment would externalise this
-    to Redis with TTL eviction.
-    """
-
     def __init__(self) -> None:
-        # Rolling window of recent crossing timestamps per pet.
         self._crossings: dict[str, deque[float]] = defaultdict(
             lambda: deque(maxlen=PACING_CROSSINGS * 4)
         )
-        # Whether the pet was inside the zone on the previous frame.
         self._was_inside: dict[str, bool] = defaultdict(bool)
-        # Timestamp the pet continuously entered the zone (None if outside).
         self._entered_at: dict[str, float | None] = defaultdict(lambda: None)
-        # Last event dispatch time per (pet, event_type) for debouncing.
         self._last_event: dict[tuple[str, str], float] = {}
 
     def update(
         self, pet_id: str, is_inside: bool, now: float
     ) -> tuple[str, float] | None:
-        """Update state; return (event_type, confidence) if an event fires."""
         was_inside = self._was_inside[pet_id]
 
-        # Detect a crossing (transition into or out of the zone).
         if is_inside != was_inside:
             self._crossings[pet_id].append(now)
             if is_inside:
@@ -98,12 +116,10 @@ class ZoneStateTracker:
 
         self._was_inside[pet_id] = is_inside
 
-        # ── Pacing: N crossings within the rolling window ──
         recent = [t for t in self._crossings[pet_id] if now - t <= PACING_WINDOW_SECONDS]
         if len(recent) >= PACING_CROSSINGS and self._should_fire(pet_id, "pacing", now):
             return ("pacing", 0.85)
 
-        # ── Prolonged waiting: continuous time-in-zone threshold ──
         entered = self._entered_at[pet_id]
         if (
             is_inside
@@ -116,7 +132,6 @@ class ZoneStateTracker:
         return None
 
     def _should_fire(self, pet_id: str, event_type: str, now: float) -> bool:
-        """Debounce: suppress repeat events of the same type within the window."""
         key = (pet_id, event_type)
         last = self._last_event.get(key)
         if last is not None and now - last < PACING_WINDOW_SECONDS:
@@ -124,9 +139,7 @@ class ZoneStateTracker:
         self._last_event[key] = now
         return True
 
-
 tracker = ZoneStateTracker()
-
 
 # ─── Schemas ─────────────────────────────────────────────────────
 
@@ -137,7 +150,6 @@ class Detection(BaseModel):
     centre: list[float]
     in_door_zone: bool
 
-
 class DetectionResponse(BaseModel):
     detections: list[Detection]
     frame_width: int
@@ -146,7 +158,7 @@ class DetectionResponse(BaseModel):
     event_type: str | None = None
     confidence_score: float | None = None
     event_id: str | None = None
-
+    thermal_scale: float = 1.0
 
 # ─── Helpers ─────────────────────────────────────────────────────
 
@@ -157,18 +169,23 @@ def _decode_image(raw: bytes) -> np.ndarray:
         raise HTTPException(status_code=422, detail="Unable to decode image payload.")
     return frame
 
-
 def _is_in_door_zone(centre: tuple[float, float]) -> bool:
-    """Test whether a centre point lies inside the Door Zone polygon."""
     result = cv2.pointPolygonTest(DOOR_ZONE_POLYGON, centre, measureDist=False)
     return result >= 0
 
-
-def _run_inference(frame: np.ndarray) -> list[Detection]:
+def _run_inference(frame: np.ndarray, current_scale: float) -> tuple[list[Detection], float]:
     if model is None:
         raise HTTPException(status_code=503, detail="Model not loaded.")
 
-    results = model(frame, conf=CONFIDENCE_THRESHOLD, verbose=False)
+    if current_scale < 1.0:
+        infer_frame = cv2.resize(frame, (0,0), fx=current_scale, fy=current_scale)
+    else:
+        infer_frame = frame
+
+    inf_start = time.time()
+    results = model(infer_frame, conf=CONFIDENCE_THRESHOLD, verbose=False)
+    inference_time = (time.time() - inf_start) * 1000
+
     detections: list[Detection] = []
 
     for result in results:
@@ -177,7 +194,8 @@ def _run_inference(frame: np.ndarray) -> list[Detection]:
             label = names[int(box.cls)]
             if label not in TARGET_CLASSES:
                 continue
-            x1, y1, x2, y2 = (float(v) for v in box.xyxy[0])
+            
+            x1, y1, x2, y2 = (float(v) / current_scale for v in box.xyxy[0])
             cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
             detections.append(
                 Detection(
@@ -188,20 +206,14 @@ def _run_inference(frame: np.ndarray) -> list[Detection]:
                     in_door_zone=_is_in_door_zone((cx, cy)),
                 )
             )
-    return detections
-
+    return detections, inference_time
 
 async def _dispatch_webhook(
     pet_id: str, event_id: str, event_type: str, confidence: float
 ) -> None:
-    """Fire a non-blocking POST to the Laravel behavioural-events endpoint.
-
-    Failures are swallowed and logged — the perception loop must never block
-    or crash on a webhook error (R-03 mitigation).
-    """
     severity = "critical" if event_type == "pacing" else "warning"
     payload = {
-        "event_id": event_id,  # client-generated UUID → idempotency key
+        "event_id": event_id,
         "pet_id": pet_id,
         "event_type": event_type,
         "severity": severity,
@@ -216,24 +228,27 @@ async def _dispatch_webhook(
     except httpx.HTTPError as exc:
         print(f"[webhook] dispatch failed for {event_id}: {exc}")
 
-
 # ─── Routes ──────────────────────────────────────────────────────
 
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {"status": "ok", "model_loaded": model is not None}
 
-
 @app.post("/detect/separation-anxiety", response_model=DetectionResponse)
 async def detect_separation_anxiety(
     pet_id: str,
     frame: UploadFile = File(...),
 ) -> DetectionResponse:
-    """Detect pets, apply Zone-Based Logic, and dispatch a webhook on event."""
+    
     raw = await frame.read()
     image = _decode_image(raw)
     height, width = image.shape[:2]
-    detections = _run_inference(image)
+    
+    current_scale = watchdog.current_scale
+    detections, inference_time = _run_inference(image, current_scale)
+    
+    # Update thermal watchdog with the latest inference latency
+    watchdog.update_and_get_scale(inference_time)
 
     now = datetime.now(timezone.utc).timestamp()
     any_in_zone = any(d.in_door_zone for d in detections)
@@ -252,14 +267,13 @@ async def detect_separation_anxiety(
             event_type=event_type,
             confidence_score=confidence,
             event_id=event_id,
+            thermal_scale=current_scale
         )
 
     return DetectionResponse(
-        detections=detections, frame_width=width, frame_height=height
+        detections=detections, frame_width=width, frame_height=height, thermal_scale=current_scale
     )
-
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("app:app", host="0.0.0.0", port=8001, reload=True)
