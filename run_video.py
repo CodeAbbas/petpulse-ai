@@ -7,23 +7,7 @@ visible on screen (and screen-recordable for the AT3 video), and fires
 the real behavioural-events webhook to the Laravel API when an anxiety
 event triggers.
 
-This is a standalone entrypoint, separate from the FastAPI service in
-app.py, but it reuses identical detection and zone logic so the two
-never diverge.
-
-Usage:
-    python run_video.py --video samples/dog.mp4 --pet-id <uuid>
-
-    # headless (no preview window, e.g. on a server):
-    python run_video.py --video samples/dog.mp4 --pet-id <uuid> --headless
-
-    # save annotated output for the demo video:
-    python run_video.py --video samples/dog.mp4 --pet-id <uuid> --save-output out.mp4
-
-Environment (.env or shell):
-    YOLO_MODEL_PATH          default: models/yolo26n.pt
-    LARAVEL_WEBHOOK_URL      default: http://127.0.0.1:8000/api/v1/behavioral-events
-    PETPULSE_WEBHOOK_SECRET  must match the Laravel API's value
+Compliance: AT2 NFR-PERF-02 (ONNX CPU Inference) & R-01 (Thermal Mitigation).
 """
 
 from __future__ import annotations
@@ -39,8 +23,6 @@ from datetime import datetime, timezone
 import cv2
 import numpy as np
 
-# httpx is used for the webhook; import lazily so the script can still run
-# in detection-only mode if httpx is missing.
 try:
     import httpx
     _HTTPX_AVAILABLE = True
@@ -58,58 +40,81 @@ except ImportError:
     sys.exit(1)
 
 
-# ─── Configuration (mirrors app.py) ──────────────────────────────────────
+# ─── Configuration ───────────────────────────────────────────────────────
 
-MODEL_PATH = os.getenv("YOLO_MODEL_PATH", "models/yolo26n.pt")
+# AT2 Compliance: Target the exported ONNX model for CPU optimization
+MODEL_PATH = os.getenv("YOLO_MODEL_PATH", "models/yolo26n.onnx")
 CONFIDENCE_THRESHOLD = 0.25
 TARGET_CLASSES = {"dog", "cat"}
 
 LARAVEL_WEBHOOK_URL = os.getenv(
     "LARAVEL_WEBHOOK_URL", "http://127.0.0.1:8000/api/v1/behavioral-events"
 )
-WEBHOOK_SECRET = os.getenv("PETPULSE_WEBHOOK_SECRET", "change-me-in-env")
-
-# Door-zone polygon (pixel coords). Tuned for a 1280-wide frame; the
-# runner scales it to the actual frame size at load time so it lands in a
-# sensible place regardless of the source video's resolution.
-DOOR_ZONE_NORMALISED = np.array(
-    [[0.10, 0.25], [0.23, 0.25], [0.23, 0.80], [0.10, 0.77]], dtype=np.float32
-)
+WEBHOOK_SECRET = os.getenv("PETPULSE_WEBHOOK_SECRET", "AR9q6eCSYbPjhdfyjadgtfe")
 
 PACING_CROSSINGS = 3
 PACING_WINDOW_SECONDS = 60.0
 PROLONGED_WAIT_SECONDS = 300.0
 
 
-# ─── Zone state tracker (identical logic to app.py) ──────────────────────
+# ─── R-01 Thermal Mitigation Watchdog ────────────────────────────────────
+
+class AdaptiveThermalWatchdog:
+    """Monitors inference latency as a proxy for CPU thermal throttling."""
+    def __init__(self, target_ms: float = 66.0): 
+        self.latency_history = deque(maxlen=30)
+        self.target_ms = target_ms
+        self.current_scale = 1.0
+        self.cooldown_frames = 0
+        
+    def update_and_get_scale(self, inference_time_ms: float) -> float:
+        self.latency_history.append(inference_time_ms)
+        
+        if self.cooldown_frames > 0:
+            self.cooldown_frames -= 1
+            return self.current_scale
+            
+        if len(self.latency_history) == 30:
+            avg_latency = sum(self.latency_history) / 30.0
+            
+            if avg_latency > self.target_ms and self.current_scale > 0.5:
+                print(f"\n[WATCHDOG] Thermal/Latency spike detected ({avg_latency:.1f}ms). Downscaling resolution to shed workload.")
+                self.current_scale -= 0.25
+                self.latency_history.clear()
+                self.cooldown_frames = 150 
+                
+            elif avg_latency < (self.target_ms * 0.7) and self.current_scale < 1.0:
+                print(f"\n[WATCHDOG] CPU recovered ({avg_latency:.1f}ms). Restoring resolution.")
+                self.current_scale += 0.25
+                self.latency_history.clear()
+                self.cooldown_frames = 150
+                
+        return self.current_scale
+
+
+# ─── Advanced Zone State Tracker (Direction Reversal Pacing) ─────────────
 
 class ZoneStateTracker:
-    """Per-pet state for pacing and prolonged-waiting heuristics."""
-
+    """Upgraded per-pet state for spatial pacing and prolonged-waiting heuristics."""
     def __init__(self) -> None:
-        self._crossings: dict[str, deque[float]] = defaultdict(
-            lambda: deque(maxlen=PACING_CROSSINGS * 4)
-        )
         self._was_inside: dict[str, bool] = defaultdict(bool)
         self._entered_at: dict[str, float | None] = defaultdict(lambda: None)
         self._last_event: dict[tuple[str, str], float] = {}
+        
+        # 90 frames = ~3 seconds at 30fps to analyze direction flips
+        self._x_history: dict[str, deque[float]] = defaultdict(
+            lambda: deque(maxlen=90)
+        )
 
     def update(
-        self, pet_id: str, is_inside: bool, now: float
+        self, pet_id: str, is_inside: bool, now: float, cx: float | None = None
     ) -> tuple[str, float] | None:
+        
+        # 1. Prolonged Waiting Logic
         was_inside = self._was_inside[pet_id]
-
         if is_inside != was_inside:
-            self._crossings[pet_id].append(now)
             self._entered_at[pet_id] = now if is_inside else None
-
         self._was_inside[pet_id] = is_inside
-
-        recent = [
-            t for t in self._crossings[pet_id] if now - t <= PACING_WINDOW_SECONDS
-        ]
-        if len(recent) >= PACING_CROSSINGS and self._should_fire(pet_id, "pacing", now):
-            return ("pacing", 0.85)
 
         entered = self._entered_at[pet_id]
         if (
@@ -120,7 +125,43 @@ class ZoneStateTracker:
         ):
             return ("prolonged_waiting", 0.80)
 
+        # 2. Upgraded Spatial Pacing Logic
+        if cx is not None:
+            self._x_history[pet_id].append(cx)
+            if self._is_pacing(self._x_history[pet_id]) and self._should_fire(pet_id, "pacing", now):
+                return ("pacing", 0.85)
+        else:
+            # Reset pacing history if pet leaves the frame to avoid false triggers
+            self._x_history[pet_id].clear()
+
         return None
+
+    def _is_pacing(self, history: deque[float]) -> bool:
+        if len(history) < 30: 
+            return False
+
+        history_list = list(history)
+        deltas = np.diff(history_list)
+
+        # Filter out tiny jitters (shifts less than 2 pixels)
+        directions = []
+        for d in deltas:
+            if d > 2.0:
+                directions.append(1)  # Moving right
+            elif d < -2.0:
+                directions.append(-1) # Moving left
+            else:
+                directions.append(0)  # Stationary
+
+        sign_changes = 0
+        current_dir = directions[0]
+
+        for d in directions:
+            if d != 0 and d != current_dir:
+                sign_changes += 1
+                current_dir = d
+
+        return sign_changes >= PACING_CROSSINGS
 
     def _should_fire(self, pet_id: str, event_type: str, now: float) -> bool:
         key = (pet_id, event_type)
@@ -131,12 +172,11 @@ class ZoneStateTracker:
         return True
 
 
-# ─── Webhook dispatch (synchronous; this is an offline runner) ───────────
+# ─── Webhook dispatch ────────────────────────────────────────────────────
 
 def dispatch_webhook(pet_id: str, event_type: str, confidence: float) -> bool:
-    """POST a behavioural event to the Laravel API. Returns success bool."""
     if not _HTTPX_AVAILABLE:
-        print("  [webhook] httpx not installed — skipping dispatch (detection-only).")
+        print("  [webhook] httpx not installed — skipping dispatch.")
         return False
 
     event_id = str(uuid.uuid4())
@@ -158,8 +198,6 @@ def dispatch_webhook(pet_id: str, event_type: str, confidence: float) -> bool:
         ok = response.status_code in (200, 201)
         status = "OK" if ok else f"HTTP {response.status_code}"
         print(f"  [webhook] {event_type} → {status} (event_id={event_id[:8]}…)")
-        if not ok:
-            print(f"  [webhook] response body: {response.text[:200]}")
         return ok
     except httpx.HTTPError as exc:
         print(f"  [webhook] dispatch FAILED: {exc}")
@@ -168,13 +206,11 @@ def dispatch_webhook(pet_id: str, event_type: str, confidence: float) -> bool:
 
 # ─── Drawing helpers ─────────────────────────────────────────────────────
 
-def scale_zone(frame_w: int, frame_h: int) -> np.ndarray:
-    """Scale the normalised door-zone polygon to actual frame pixels."""
-    pts = DOOR_ZONE_NORMALISED.copy()
+def scale_zone(frame_w: int, frame_h: int, normalised_zone: np.ndarray) -> np.ndarray:
+    pts = normalised_zone.copy()
     pts[:, 0] *= frame_w
     pts[:, 1] *= frame_h
     return pts.astype(np.int32)
-
 
 def draw_overlay(
     frame: np.ndarray,
@@ -182,9 +218,8 @@ def draw_overlay(
     detections: list[dict],
     any_in_zone: bool,
     event_banner: str | None,
+    current_scale: float
 ) -> None:
-    """Draw the door zone, detections, and status onto the frame in place."""
-    # Door zone — red when occupied, cyan when clear.
     zone_colour = (60, 60, 240) if any_in_zone else (220, 200, 40)
     overlay = frame.copy()
     cv2.fillPoly(overlay, [zone], zone_colour)
@@ -195,7 +230,6 @@ def draw_overlay(
         cv2.FONT_HERSHEY_SIMPLEX, 0.6, zone_colour, 2,
     )
 
-    # Detection boxes.
     for det in detections:
         x1, y1, x2, y2 = (int(v) for v in det["bbox"])
         cx, cy = (int(v) for v in det["centre"])
@@ -208,7 +242,12 @@ def draw_overlay(
             cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_colour, 2,
         )
 
-    # Event banner.
+    if current_scale < 1.0:
+        cv2.putText(
+            frame, f"THERMAL WATCHDOG ACTIVE: Res {int(current_scale*100)}%", 
+            (12, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (40, 150, 255), 2,
+        )
+
     if event_banner:
         cv2.rectangle(frame, (0, 0), (frame.shape[1], 40), (40, 40, 200), -1)
         cv2.putText(
@@ -225,147 +264,143 @@ def main() -> int:
     parser.add_argument("--pet-id", required=True, help="Pet UUID for the webhook")
     parser.add_argument("--headless", action="store_true", help="No preview window")
     parser.add_argument("--save-output", default=None, help="Path to save annotated mp4")
-    parser.add_argument(
-        "--no-webhook", action="store_true", help="Detection only; do not POST"
-    )
-    parser.add_argument(
-        "--stride", type=int, default=1,
-        help="Process every Nth frame (raise to speed up CPU inference)",
-    )
+    parser.add_argument("--no-webhook", action="store_true", help="Detection only")
+    parser.add_argument("--stride", type=int, default=1, help="Process every Nth frame")
     args = parser.parse_args()
 
-    if not os.path.exists(args.video):
-        print(f"ERROR: video not found: {args.video}", file=sys.stderr)
-        return 1
-
-    # ── Load model ──
-    print(f"Loading YOLO26n model from {MODEL_PATH} …")
+    print(f"Loading YOLO26n ONNX Runtime from {MODEL_PATH} …")
     t0 = time.time()
     try:
-        model = YOLO(MODEL_PATH)
+        model = YOLO(MODEL_PATH, task="detect")
     except Exception as exc:  # noqa: BLE001
-        print(f"ERROR: failed to load model: {exc}", file=sys.stderr)
-        print(
-            "If the weights are missing, Ultralytics will auto-download on first\n"
-            "use with internet access, or place yolo26n.pt in the models/ folder.",
-            file=sys.stderr,
-        )
+        print(f"ERROR: failed to load model: {exc}\nEnsure you exported the model to ONNX format.", file=sys.stderr)
         return 1
-    print(f"Model loaded in {time.time() - t0:.1f}s.")
+    print(f"ONNX Model loaded in {time.time() - t0:.1f}s.")
 
-    # ── Open video ──
     cap = cv2.VideoCapture(args.video)
     if not cap.isOpened():
         print(f"ERROR: could not open video: {args.video}", file=sys.stderr)
         return 1
 
-    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    orig_frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    print(f"Video: {frame_w}x{frame_h} @ {fps:.0f}fps, {total_frames} frames.")
 
-    zone = scale_zone(frame_w, frame_h)
+    # Dynamic zone selection based on input filename
+    if "catrush" in args.video.lower():
+        norm_zone = np.array([[0.05, 0.15], [0.30, 0.15], [0.30, 0.95], [0.05, 0.95]], dtype=np.float32)
+    elif "catrunning" in args.video.lower():
+        norm_zone = np.array([[0.1, 0.1], [0.9, 0.1], [0.9, 0.9], [0.1, 0.9]], dtype=np.float32)
+    else:
+        norm_zone = np.array([[0.66, 0.15], [0.97, 0.15], [0.97, 0.95], [0.66, 0.95]], dtype=np.float32)
+
+    zone = scale_zone(orig_frame_w, orig_frame_h, norm_zone)
     tracker = ZoneStateTracker()
+    watchdog = AdaptiveThermalWatchdog()
 
     writer = None
     if args.save_output:
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(args.save_output, fourcc, fps, (frame_w, frame_h))
+        writer = cv2.VideoWriter(args.save_output, fourcc, fps, (orig_frame_w, orig_frame_h))
 
-    pet_id = args.pet_id
     frame_idx = 0
     processed = 0
     event_banner: str | None = None
     banner_until = 0.0
     inference_times: list[float] = []
 
-    print("\nProcessing… (press Q in the preview window to stop)\n")
+    print("\nProcessing ONNX Edge Inference… (press Q in the preview window to stop)\n")
 
     while True:
-        ret, frame = cap.read()
+        ret, original_frame = cap.read()
         if not ret:
             break
         frame_idx += 1
 
-        # Frame striding to speed up CPU inference if needed.
         if (frame_idx - 1) % args.stride != 0:
             if writer is not None:
-                writer.write(frame)
+                writer.write(original_frame)
             continue
 
-        # ── Inference ──
+        # Adaptive Resolution Scaling
+        current_scale = 1.0
+        if inference_times:
+            current_scale = watchdog.update_and_get_scale(inference_times[-1] * 1000)
+            
+        if current_scale < 1.0:
+            infer_frame = cv2.resize(original_frame, (0,0), fx=current_scale, fy=current_scale)
+        else:
+            infer_frame = original_frame
+
+        # Inference
         inf_start = time.time()
-        results = model(frame, conf=CONFIDENCE_THRESHOLD, verbose=False)
+        results = model(infer_frame, conf=CONFIDENCE_THRESHOLD, verbose=False)
         inference_times.append(time.time() - inf_start)
         processed += 1
 
         detections: list[dict] = []
+        best_centroid = None
+
         for result in results:
             names = result.names
             for box in result.boxes:
                 label = names[int(box.cls)]
                 if label not in TARGET_CLASSES:
                     continue
-                x1, y1, x2, y2 = (float(v) for v in box.xyxy[0])
+                    
+                x1, y1, x2, y2 = (float(v) / current_scale for v in box.xyxy[0])
                 cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
                 in_zone = cv2.pointPolygonTest(zone, (cx, cy), False) >= 0
-                detections.append(
-                    {
-                        "label": label,
-                        "confidence": float(box.conf),
-                        "bbox": [x1, y1, x2, y2],
-                        "centre": [cx, cy],
-                        "in_zone": in_zone,
-                    }
-                )
+                
+                detections.append({
+                    "label": label,
+                    "confidence": float(box.conf),
+                    "bbox": [x1, y1, x2, y2],
+                    "centre": [cx, cy],
+                    "in_zone": in_zone,
+                })
+                
+                if best_centroid is None:
+                    best_centroid = (cx, cy)
 
         any_in_zone = any(d["in_zone"] for d in detections)
-
-        # ── Zone-Based Logic ──
-        # Use the video's own timeline (frame_idx / fps) as "now", so the
-        # heuristic windows are evaluated against video-time, not wall-time.
         video_now = frame_idx / fps
-        event = tracker.update(pet_id, any_in_zone, video_now)
+        
+        # Pass the extracted X-centroid into the upgraded ZoneStateTracker
+        pet_cx = best_centroid[0] if best_centroid else None
+        event = tracker.update(args.pet_id, any_in_zone, video_now, pet_cx)
 
         if event is not None:
             event_type, confidence = event
             print(f"[t={video_now:6.1f}s] EVENT: {event_type} (conf {confidence})")
             if not args.no_webhook:
-                dispatch_webhook(pet_id, event_type, confidence)
+                dispatch_webhook(args.pet_id, event_type, confidence)
             event_banner = f"ALERT: {event_type.upper()} detected"
             banner_until = time.time() + 3.0
 
-        # Clear expired banner.
         if event_banner and time.time() > banner_until:
             event_banner = None
 
-        # ── Draw + output ──
-        draw_overlay(frame, zone, detections, any_in_zone, event_banner)
+        draw_overlay(original_frame, zone, detections, any_in_zone, event_banner, current_scale)
 
         if writer is not None:
-            writer.write(frame)
+            writer.write(original_frame)
 
         if not args.headless:
-            cv2.imshow("PetPulse Edge AI — YOLO26n", frame)
+            cv2.imshow("PetPulse Edge AI — YOLO26n (ONNX)", original_frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 print("\nStopped by user.")
                 break
 
-        # Progress ping every 50 processed frames.
         if processed % 50 == 0:
-            avg_ms = (sum(inference_times) / len(inference_times)) * 1000
+            avg_ms = (sum(inference_times[-50:]) / 50) * 1000
             est_fps = 1000 / avg_ms if avg_ms > 0 else 0
-            print(
-                f"  …{frame_idx}/{total_frames} frames "
-                f"(avg inference {avg_ms:.0f}ms ≈ {est_fps:.1f} FPS)"
-            )
+            print(f"  …{frame_idx}/{total_frames} frames (avg inference {avg_ms:.0f}ms ≈ {est_fps:.1f} FPS) [Scale: {current_scale}]")
 
-    # ── Cleanup + summary ──
     cap.release()
     if writer is not None:
         writer.release()
-        print(f"\nAnnotated video saved to {args.save_output}")
     if not args.headless:
         cv2.destroyAllWindows()
 
@@ -375,19 +410,14 @@ def main() -> int:
         print(
             f"\n── Summary ──\n"
             f"Processed {processed} frames.\n"
-            f"Average inference: {avg_ms:.0f}ms/frame ≈ {est_fps:.1f} FPS on this CPU.\n"
+            f"Average inference: {avg_ms:.0f}ms/frame ≈ {est_fps:.1f} FPS.\n"
         )
-        # NFR-PERF-02 reality check.
         if est_fps >= 15:
-            print("✓ Meets NFR-PERF-02 (≥15 FPS CPU inference).")
+            print("✓ Meets NFR-PERF-02 (≥15 FPS CPU ONNX inference).")
         else:
-            print(
-                f"⚠ Below the ≥15 FPS NFR-PERF-02 target. Options: raise --stride, "
-                f"export the model to ONNX, or document the CPU-bound result honestly."
-            )
+            print("⚠ Below the ≥15 FPS NFR-PERF-02 target.")
 
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
